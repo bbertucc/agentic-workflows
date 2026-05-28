@@ -1,0 +1,53 @@
+name: log-watch
+
+# Scheduled detector. Runs scripts/log-watch.js, which imports the consumer
+# repo's scripts/log-watch-detector.js and opens an idempotent GitHub issue
+# when the detector returns an alert. Close the issue once the underlying
+# condition is resolved — while it stays open, the alert is suppressed.
+#
+# This workflow only runs if scripts/log-watch-detector.js exists in the repo.
+# See examples/log-watch-detector-template.js for the contract.
+
+on:
+  schedule:
+    - cron: '37 */2 * * *'  # every 2 hours
+  workflow_dispatch:
+
+concurrency:
+  group: log-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check for detector
+        id: check
+        run: |
+          if [ -f scripts/log-watch-detector.js ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::scripts/log-watch-detector.js not found — skipping. Drop one in to enable log-watch (see examples/log-watch-detector-template.js)."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.present == 'true'
+        with:
+          node-version: '20'
+
+      - name: Run detector
+        if: steps.check.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Forward any custom env the detector needs. Add your own here:
+          #   MY_API_URL: ${{ secrets.MY_API_URL }}
+          #   MY_API_TOKEN: ${{ secrets.MY_API_TOKEN }}
+        run: node scripts/log-watch.js

@@ -1,0 +1,217 @@
+name: issue-intake
+
+# Triages every new (or reopened, or replied-to) issue.
+#
+# Outcomes:
+#   - `ready-for-pilot`     — enough info for a pilot or human to act on
+#   - `needs-info`          — vague but real; agent asks ≤3 clarifying questions
+#   - `needs-decomposition` — too broad for one PR; reporter is asked to split
+#   - close                 — spam / off-topic only
+#
+# Configuration:
+#   Variables:
+#     PROJECT_NAME     — friendly name used in the prompt (default: repo name)
+#     AWS_REGION       — Bedrock region (default: us-east-2)
+#     MODEL_INTAKE     — model id (default: Haiku)
+#   Secrets (one of):
+#     AWS_BEDROCK_ROLE_ARN  — IAM role for Bedrock via OIDC (preferred)
+#     ANTHROPIC_API_KEY     — API key (used when AWS_BEDROCK_ROLE_ARN is unset)
+
+on:
+  issues:
+    types: [opened, reopened]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to triage (re-run intake on an existing issue)
+        required: true
+        type: string
+
+jobs:
+  intake:
+    # - `opened`: skip bot-authored (loop prevention) and issues already labelled (idempotency)
+    # - `reopened`: always run — explicit signal the previous classification needs revisiting
+    # - `issue_comment` on a `needs-info` issue (non-bot, not a PR comment): a
+    #   reply may be the answer the agent asked for
+    # - `workflow_dispatch`: always run
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && github.event.action == 'reopened' &&
+       !contains(github.event.issue.user.login, '[bot]')) ||
+      (github.event_name == 'issues' && github.event.action == 'opened' &&
+       !contains(github.event.issue.user.login, '[bot]') &&
+       !contains(github.event.issue.labels.*.name, 'ready-for-pilot') &&
+       !contains(github.event.issue.labels.*.name, 'needs-info')) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request == null &&
+       contains(github.event.issue.labels.*.name, 'needs-info') &&
+       !contains(github.event.comment.user.login, '[bot]'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+      id-token: write
+    env:
+      PROJECT_NAME: ${{ vars.PROJECT_NAME || github.event.repository.name }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-2' }}
+      MODEL_INTAKE: ${{ vars.MODEL_INTAKE || 'us.anthropic.claude-haiku-4-5-20251001-v1:0' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Detect auth mode
+        id: auth
+        env:
+          BEDROCK_ROLE: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+        run: |
+          if [ -n "$BEDROCK_ROLE" ]; then
+            echo "mode=bedrock" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=api" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ensure intake labels exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create ready-for-pilot --color 1F883D --description "Triaged: enough info to act on" 2>/dev/null || true
+          gh label create needs-info --color D4C5F9 --description "Intake agent asked the reporter for more details" 2>/dev/null || true
+          gh label create needs-decomposition --color FBCA04 --description "Real request, but too broad for one PR — break into smaller issues" 2>/dev/null || true
+
+      - name: Configure AWS credentials (Bedrock OIDC)
+        if: steps.auth.outputs.mode == 'bedrock'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: anthropics/claude-code-action@v1
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
+          PROJECT_NAME: ${{ env.PROJECT_NAME }}
+        with:
+          use_bedrock: ${{ steps.auth.outputs.mode == 'bedrock' && 'true' || 'false' }}
+          anthropic_api_key: ${{ steps.auth.outputs.mode == 'api' && secrets.ANTHROPIC_API_KEY || '' }}
+          allowed_bots: "claude"
+          show_full_output: true
+          claude_args: "--allowedTools Bash(*),Read(*),Glob,Grep --max-turns 15 --model ${{ env.MODEL_INTAKE }}"
+          prompt: |
+            You are the issue-intake agent for ${{ env.PROJECT_NAME }} triaging issue #${{ github.event.issue.number || inputs.issue_number }}.
+
+            Begin immediately. Do not ask the user for clarification or for the issue
+            number — issue #${{ github.event.issue.number || inputs.issue_number }} is your assignment.
+            Run the Step 1 commands below as your first action.
+
+            Your job is to prepare new issues so a pilot agent or a human can act on them
+            without round-tripping for basic details.
+
+            ## What downstream consumers need
+            Whether picked up by a pilot agent or a human, an actionable issue has:
+            - Reproduction steps (URL, what was clicked, which feature)
+            - Expected vs. actual behavior stated clearly
+            - Any error message, screenshot, or console output if applicable
+            - Environment (browser / device / role)
+
+            Vague reports ("something is broken", "can we make X better") block both
+            humans and agents.
+
+            ## Step 1: Read context (≤3 turns)
+            - `gh issue view ${{ github.event.issue.number || inputs.issue_number }} --json title,body,labels,author,comments` — read the issue
+            - Skim `CLAUDE.md`, `AGENTS.md`, or `README.md` to understand the project
+
+            **Only work on `${{ github.event.issue.number || inputs.issue_number }}`** — do not scan other issues.
+
+            ## Re-run guard (reopens, comment replies, manual dispatches)
+            If this run is a reopen, a new comment on a `needs-info` issue, or a manual
+            dispatch, the issue may already have history. Handle the likely cases:
+
+            - **Issue previously closed by the intake agent and reopened, no intake label** →
+              the reporter is saying you misread it. Treat this as a fresh classification
+              but take the reopen as a strong hint that it IS a real issue. Prefer
+              outcome A or B; only close again (outcome C) if clearly still off-topic.
+            - **`needs-info` label present, reporter has replied** → check the comments:
+              - Reply answers enough → remove `needs-info`, add `ready-for-pilot`, post
+                a short confirmation ("Got it — tagged ready-for-pilot.").
+              - Reply doesn't fully answer but the gap is narrow → leave `needs-info`
+                and post ONE focused follow-up that names exactly what's still missing.
+                Reference what they did say. Max 2 follow-up questions.
+              - Reply reveals this is an epic / multi-component feature → switch to
+                `needs-decomposition`, name the components you see, and ask the
+                reporter to split. Pattern: "This is bigger than one PR — we see
+                [X], [Y], [Z]. Could you open a separate issue for each?"
+              - **Never** silently leave `needs-info` after a reporter reply. Say something.
+            - **`needs-decomposition` label present, reporter has replied with new issues** →
+              confirm the split, close this umbrella issue pointing to the new ones.
+              If they haven't split yet, leave the label and don't comment again.
+            - **`ready-for-pilot` label present** → almost always leave alone unless
+              the classification is obviously wrong.
+
+            When switching labels, remove the old one first:
+            `gh issue edit ${{ github.event.issue.number || inputs.issue_number }} --remove-label <old>` before adding the new.
+
+            ## Step 2: Classify and act (1 pass, idempotent)
+
+            **A. Already actionable** — names something *concrete*. At least ONE of:
+            - An exact string / label / copy change
+            - A specific error message, log, or screenshot that pinpoints the problem
+            - A concrete page/URL/component AND specific observed-vs-expected behavior
+
+            A "clear user-visible request" alone is NOT sufficient. When in doubt
+            between A and B, **prefer B**. A false-positive `needs-info` is cheap
+            (reporter clarifies); a false-positive `ready-for-pilot` fuels pilot loops.
+
+            ```
+            gh issue edit ${{ github.event.issue.number || inputs.issue_number }} --add-label ready-for-pilot
+            gh issue comment ${{ github.event.issue.number || inputs.issue_number }} --body "Thanks — this has enough detail for a pilot or a human to pick up. Tagged \`ready-for-pilot\`."
+            ```
+
+            **B. Needs info** — genuine but vague. Post exactly ONE comment using this
+            template, then label. ONE `gh issue comment` call — no retries.
+
+            ```
+            gh issue comment ${{ github.event.issue.number || inputs.issue_number }} --body "Thanks for opening this. A few details would help us act on it:
+
+            1. <question>
+            2. <question>
+            3. <question>
+
+            Reply here with what you can share and we'll pick this up."
+            gh issue edit ${{ github.event.issue.number || inputs.issue_number }} --add-label needs-info
+            ```
+
+            **C. Spam or problematic** — close politely. Use this only for:
+            - Obvious spam (promotions, link spam, SEO)
+            - Content unrelated to this project
+            - Abusive, threatening, hateful, or sexually explicit content
+            - Clearly malicious / "security research" extortion attempts
+
+            Err on the side of B (needs-info) when unsure. Low-effort or vague reports
+            are NOT spam — those go to B.
+
+            ```
+            gh issue comment ${{ github.event.issue.number || inputs.issue_number }} --body "Hey, this doesn't look like a ${{ env.PROJECT_NAME }} bug or feature request, so we're closing it. If we got that wrong, please reopen with a sentence or two about what you were doing."
+            gh issue close ${{ github.event.issue.number || inputs.issue_number }} --reason "not planned"
+            ```
+
+            Do not add a label when closing — the closed+comment state is the signal.
+
+            ## Question rules (critical)
+            - Ask ONLY for things the reporter can provide. Never ask "which file is
+              affected" or "can you check the code" — that's our job, not theirs.
+            - Favor: reproduction steps, URL, expected vs. actual, error message or
+              screenshot, browser + OS, role, whether it worked before. For vague
+              feature requests: the specific behavior wanted, and what problem it solves.
+            - Max 3 questions. One focused question beats three vague ones.
+            - Don't ask what's already answered in the body.
+
+            ## Do not
+            - Don't close issues except in outcome C (spam / off-topic).
+            - Don't add labels other than `ready-for-pilot`, `needs-info`, or `needs-decomposition`.
+            - Don't engage bot-authored issues — the job's `if:` condition already filters these.
+            - Don't lecture or offer design opinions. This is intake, not review.
+            - Don't `@` anyone.
+            - Don't look at other issues; stick to `${{ github.event.issue.number || inputs.issue_number }}`.

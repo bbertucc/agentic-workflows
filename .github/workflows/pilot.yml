@@ -1,0 +1,265 @@
+name: pilot
+
+# Autonomous engineering pilot. Runs on a schedule; picks ONE actionable
+# signal per run and opens a PR — or skips with a reason.
+#
+# Picking order (top-down, first match wins):
+#   1. `ready-for-pilot` issue not blocked by an open PR
+#   2. Extras (if scripts/pilot-report-extras.js is present and surfaces signals)
+#
+# Configuration:
+#   Variables:
+#     PROJECT_NAME       — friendly name used in prompts (default: repo name)
+#     TEST_COMMAND       — shell to verify changes (default: skip)
+#     AWS_REGION         — Bedrock region (default: us-east-2)
+#     MODEL_PILOT        — model id (default: Sonnet)
+#     PILOT_LABEL        — label for pilot-authored PRs (default: `pilot`)
+#     READY_LABEL        — label on actionable issues (default: `ready-for-pilot`)
+#     PILOT_AUTHOR       — github login of the pilot bot (e.g. `my-project-pilot`)
+#     PILOT_SCHEDULE     — cron string (default: '11 16 * * 0-4', ~11AM ET weekdays)
+#   Secrets (one of):
+#     AWS_BEDROCK_ROLE_ARN  — IAM role for Bedrock via OIDC (preferred)
+#     ANTHROPIC_API_KEY     — API key (used when AWS_BEDROCK_ROLE_ARN is unset)
+#
+# Optional repo files:
+#   .github/pilot-tiers.json     — { tier: regex[] } classifier override
+#   .github/PILOT_GUIDELINES.md  — project-specific anti-goals/priorities
+#                                  (read by the agent each run)
+#   scripts/pilot-report-extras.js — { extrasMarkdown(): string }
+#                                    appended to the pilot report (KPIs,
+#                                    error monitors, severity interrupts)
+
+on:
+  schedule:
+    # Default: weekday mornings (Sun-Thu 11:11 AM ET = 16:11 UTC).
+    # GitHub Actions doesn't evaluate vars in `cron:`, so changing the
+    # cadence means editing this line. (vars.PILOT_SCHEDULE is documented
+    # for reference but inert until GitHub supports it.)
+    - cron: '11 16 * * 0-4'
+  workflow_dispatch:
+
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    env:
+      PROJECT_NAME: ${{ vars.PROJECT_NAME || github.event.repository.name }}
+      TEST_COMMAND: ${{ vars.TEST_COMMAND }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-2' }}
+      MODEL_PILOT: ${{ vars.MODEL_PILOT || 'us.anthropic.claude-sonnet-4-5-20250929-v1:0' }}
+      PILOT_LABEL: ${{ vars.PILOT_LABEL || 'pilot' }}
+      READY_LABEL: ${{ vars.READY_LABEL || 'ready-for-pilot' }}
+      PILOT_AUTHOR: ${{ vars.PILOT_AUTHOR }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Detect auth mode
+        id: auth
+        env:
+          BEDROCK_ROLE: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+        run: |
+          if [ -n "$BEDROCK_ROLE" ]; then
+            echo "mode=bedrock" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=api" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Prevent claude-code-action workspace artifacts from being committed.
+      - name: Ignore Claude Action workspace artifacts
+        run: |
+          mkdir -p .git/info
+          { echo '.claude-pr/'; echo '.claude/'; } >> .git/info/exclude
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Ensure pilot label exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "$PILOT_LABEL" --color 5319E7 --description "PR opened by the pilot agent" 2>/dev/null || true
+
+      - name: Generate pilot report
+        id: report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node scripts/pilot-report.js > /tmp/pilot-report.md
+          # Extract the machine-readable blocklist marker for post-action verification.
+          BLOCKLIST=$(grep -oE '<!-- PILOT_BLOCKLIST: [0-9,]* -->' /tmp/pilot-report.md | head -1 | sed -E 's/<!-- PILOT_BLOCKLIST: ([0-9,]*) -->/\1/')
+          echo "$BLOCKLIST" > /tmp/pilot-blocklist.txt
+          echo "Blocked issues: ${BLOCKLIST:-none}"
+          echo "Generated pilot report:"
+          cat /tmp/pilot-report.md
+
+      - name: Configure AWS credentials (Bedrock OIDC)
+        if: steps.auth.outputs.mode == 'bedrock'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: anthropics/claude-code-action@v1
+        id: agent
+        env:
+          PROJECT_NAME: ${{ env.PROJECT_NAME }}
+          PILOT_LABEL: ${{ env.PILOT_LABEL }}
+          READY_LABEL: ${{ env.READY_LABEL }}
+          TEST_COMMAND: ${{ env.TEST_COMMAND }}
+        with:
+          use_bedrock: ${{ steps.auth.outputs.mode == 'bedrock' && 'true' || 'false' }}
+          anthropic_api_key: ${{ steps.auth.outputs.mode == 'api' && secrets.ANTHROPIC_API_KEY || '' }}
+          show_full_output: true
+          claude_args: "--allowedTools Bash(*),Read(*),Write(*),Edit,Glob,Grep --max-turns 50 --model ${{ env.MODEL_PILOT }}"
+          prompt: |
+            You are the autonomous engineering pilot for ${{ env.PROJECT_NAME }}.
+            You have a turn budget — be efficient. Pick one thing, fix it, test it, ship it.
+            **SKIP is a valid and valued outcome.** A skipped day is better than a duplicate or misaligned PR.
+
+            ## Step 1: Read context (≤4 turns)
+            - Read `/tmp/pilot-report.md` — today's blocklist, pilot merge-rate, tier-classified `${{ env.READY_LABEL }}` issues, and (when configured) extras
+            - Read `/tmp/pilot-blocklist.txt` — comma-separated issue numbers blocked from re-picking
+            - Read `CLAUDE.md`, `AGENTS.md`, or `CONTRIBUTING.md` (whichever exist) for conventions
+            - Read `.github/PILOT_GUIDELINES.md` if present — project-specific anti-goals, severity rules, and priorities
+            - Do NOT re-query `gh pr list` or `gh issue list` — the report already has the synthesized view
+
+            ## Step 2: Triage — pick ONE thing or SKIP (1 turn)
+
+            **Hard rules (violations abort the run):**
+            1. If a candidate references a blocked issue from `/tmp/pilot-blocklist.txt`, **DO NOT PICK IT**. An open PR already exists.
+            2. If the report's "Looped issues" section names an issue, **DO NOT PICK IT**. Two or more closed-unmerged PRs already tried — the reporter needs to clarify.
+            3. Do NOT violate any anti-goal listed in `.github/PILOT_GUIDELINES.md`.
+
+            **Severity interrupt:** if the report's extras section flags a severity interrupt
+            (e.g. data-loss, security, outage), it outranks the entire issue queue. Fix it
+            or escalate with a loud `SKIP: ESCALATING …` line — never defer silently.
+
+            **Strict picking order — first match wins, do not skip ahead:**
+
+            1. **Community-authored `${{ env.READY_LABEL }}` issue.** Any issue in a Tier section whose author is
+               NOT the pilot bot. When multiple exist, pick by Tier (1 > 2 > 3 > …), then by oldest `createdAt`.
+               Community issues take priority over extras signals — someone named took the time to file it.
+
+            2. **Self-filed `${{ env.READY_LABEL }}` issue** (author == pilot bot). Same tier + age tie-breaks.
+
+            3. **Extras signal** — only when no `${{ env.READY_LABEL }}` issues exist or all are blocked.
+
+            **SKIP outcomes (exit 0 with a single line to stdout):**
+            - `SKIP: ESCALATING <signal> — needs maintainer` — severity interrupt fired but can't be safely fixed in one PR
+            - `SKIP: all community ready-for-pilot issues are covered by open pilot PRs (#N, #M)`
+            - `SKIP: no actionable signal today`
+            - `SKIP: only candidate is an anti-goal (<describe>)`
+
+            Print the SKIP line and stop. Do not invent work. SKIP is success.
+
+            ## Step 3: Implement (≤15 turns)
+            - BEFORE editing any file, create a working branch:
+              `BRANCH="pilot/$(date +%Y-%m-%d)-<short-slug>" && git checkout -b "$BRANCH"`
+            - Do NOT commit directly to the default branch under any circumstances.
+            - Read only the files you need to change
+            - Make exactly ONE focused change
+            - No breaking changes, data migrations, or large refactors
+
+            ## Step 4: Verify and ship (≤5 turns)
+            ${{ env.TEST_COMMAND != '' && format('- Run `{0}` — all tests must pass', env.TEST_COMMAND) || '- (No TEST_COMMAND configured — skipping verification step)' }}
+            - **When the pick is issue-driven**, credit the issue author on the commit:
+              1. `AUTHOR=$(gh issue view <N> --json author --jq .author.login)`
+              2. Add a `Co-Authored-By:` trailer (blank line before it):
+                 `Co-Authored-By: <login> <login@users.noreply.github.com>`
+                 Skip the trailer if AUTHOR equals the pilot bot.
+            - Commit on your branch, then push: `git push -u origin "$BRANCH"`
+            - Create a PR with `gh pr create --head "$BRANCH" --label $PILOT_LABEL`:
+              - Title: imperative mood, under 70 chars
+              - Reference the issue with `Fixes #N` (required when issue-driven — the post-action dup-check reads this)
+              - **Body must include a Triage table and a User impact line:**
+
+                ```
+                ## Triage
+
+                | Signal | Source | Tier | Decision | Why |
+                |--------|--------|------|----------|-----|
+                | <picked-signal> | issue / extras | 1–5 | fix | <one sentence> |
+
+                **User impact:** low / medium / high — <one-sentence explanation>
+
+                ## Changes
+                <what + why>
+                ```
+
+      - name: Verify agent did not duplicate a blocked issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PILOT_LABEL: ${{ env.PILOT_LABEL }}
+        run: |
+          BLOCKLIST=$(cat /tmp/pilot-blocklist.txt 2>/dev/null || echo "")
+          if [ -z "$BLOCKLIST" ]; then
+            echo "No blocklist; skipping post-action dup-check."
+            exit 0
+          fi
+          CUTOFF=$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-10M +%Y-%m-%dT%H:%M:%SZ)
+          RECENT_PRS=$(gh pr list --label "$PILOT_LABEL" --state open --limit 5 \
+            --search "created:>=$CUTOFF" \
+            --json number,body)
+          # Process substitution so `exit 1` inside the loop actually fails the step
+          # (a pipe-to-while would run the loop in a subshell).
+          FAILED=0
+          while read -r pr; do
+            NUM=$(echo "$pr" | jq -r '.number')
+            BODY=$(echo "$pr" | jq -r '.body')
+            LINKED=$(echo "$BODY" | grep -oiE '(fixes|closes|resolves)[[:space:]]+#[0-9]+' | grep -oE '[0-9]+' | sort -u)
+            for ISSUE in $LINKED; do
+              if echo ",$BLOCKLIST," | grep -q ",$ISSUE,"; then
+                echo "::error::PR #$NUM references blocked issue #$ISSUE (already has an open pilot PR). Closing."
+                gh pr close "$NUM" --comment "Automatically closed: this PR duplicates an already-open pilot PR for issue #$ISSUE."
+                FAILED=1
+              fi
+            done
+          done < <(echo "$RECENT_PRS" | jq -c '.[]')
+          if [ "$FAILED" -eq 1 ]; then exit 1; fi
+          echo "Post-action dup-check passed."
+
+      - name: Auto-escalate looping issues
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PILOT_LABEL: ${{ env.PILOT_LABEL }}
+          READY_LABEL: ${{ env.READY_LABEL }}
+        run: |
+          # Find ready-for-pilot issues with ≥2 closed-unmerged pilot PRs.
+          # When a loop is detected: relabel ready-for-pilot → needs-info and
+          # post a comment asking the reporter to clarify.
+          SINCE=$(date -u -d '30 days ago' +%Y-%m-%d 2>/dev/null || date -u -v-30d +%Y-%m-%d)
+          CLOSED_PRS=$(gh pr list --label "$PILOT_LABEL" --state closed --limit 50 \
+            --search "closed:>=$SINCE" \
+            --json number,body,mergedAt)
+          ATTEMPTS=$(echo "$CLOSED_PRS" | jq -r '
+            [.[] | select(.mergedAt == null) | .body // "" |
+              [scan("(?i)(?:fixes|closes|resolves)\\s+#([0-9]+)")[]] | .[]] |
+            group_by(.) | map({issue: .[0], count: length}) | .[] |
+            select(.count >= 2) | "\(.issue) \(.count)"')
+          if [ -z "$ATTEMPTS" ]; then
+            echo "No looping issues detected."
+            exit 0
+          fi
+          echo "$ATTEMPTS" | while read -r ISSUE COUNT; do
+            LABELS=$(gh issue view "$ISSUE" --json labels --jq '.labels | map(.name) | join(",")' 2>/dev/null || echo "")
+            if ! echo ",$LABELS," | grep -q ",$READY_LABEL,"; then
+              echo "Issue #$ISSUE has $COUNT closed pilot PRs but is not $READY_LABEL; skip."
+              continue
+            fi
+            PR_REFS=$(echo "$CLOSED_PRS" | jq -r --arg i "$ISSUE" '
+              [.[] | select(.mergedAt == null) |
+                select(.body // "" | test("(?i)(?:fixes|closes|resolves)\\s+#\($i)\\b")) |
+                "#\(.number)"] | join(", ")')
+            gh issue edit "$ISSUE" --remove-label "$READY_LABEL" --add-label needs-info
+            gh issue comment "$ISSUE" --body "The pilot attempted this $COUNT× (closed PRs: $PR_REFS) without a merge. Re-tagging \`needs-info\` — could you clarify which of those attempts matches what you wanted, or what's missing? Once clarified we'll route it back to the pilot."
+            echo "Relabeled issue #$ISSUE."
+          done

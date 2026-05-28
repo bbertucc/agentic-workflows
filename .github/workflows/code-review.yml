@@ -1,0 +1,273 @@
+name: Code Review
+
+# Skeptical PR reviewer powered by anthropics/claude-code-action.
+# Posts exactly one review per commit; per-commit idempotent.
+#
+# Configuration (repo Settings → Secrets and variables → Actions):
+#   Variables:
+#     PROJECT_NAME       — friendly name used in the prompt (default: repo name)
+#     TEST_COMMAND       — shell to run tests (default: skip)
+#     AWS_REGION         — Bedrock region (default: us-east-2)
+#     MODEL_REVIEW       — model id (default: us.anthropic.claude-sonnet-4-5-20250929-v1:0)
+#   Secrets (one of):
+#     AWS_BEDROCK_ROLE_ARN  — IAM role for Bedrock via OIDC (preferred)
+#     ANTHROPIC_API_KEY     — API key (used when AWS_BEDROCK_ROLE_ARN is unset)
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/dependabot.yml'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review'
+        required: true
+        type: string
+
+jobs:
+  review:
+    # Skip drafts and dependabot. workflow_dispatch and ready_for_review bypass.
+    if: |
+      (github.event_name == 'workflow_dispatch' ||
+        github.event.action == 'ready_for_review' ||
+        github.event.pull_request.draft != true) &&
+      (github.event_name == 'workflow_dispatch' ||
+        github.event.pull_request.user.login != 'dependabot[bot]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write  # for Bedrock OIDC
+    env:
+      PROJECT_NAME: ${{ vars.PROJECT_NAME || github.event.repository.name }}
+      TEST_COMMAND: ${{ vars.TEST_COMMAND }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-2' }}
+      MODEL_REVIEW: ${{ vars.MODEL_REVIEW || 'us.anthropic.claude-sonnet-4-5-20250929-v1:0' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve PR + head sha
+        id: ctx
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PR_NUMBER="${{ inputs.pr_number }}"
+            META=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER")
+            HEAD_SHA=$(echo "$META" | jq -r .head.sha)
+            BASE_REF=$(echo "$META" | jq -r .base.ref)
+          else
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            BASE_REF="${{ github.event.pull_request.base.ref }}"
+          fi
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Detect auth mode
+        id: auth
+        env:
+          BEDROCK_ROLE: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+        run: |
+          if [ -n "$BEDROCK_ROLE" ]; then
+            echo "mode=bedrock" >> "$GITHUB_OUTPUT"
+            echo "Auth: Bedrock OIDC"
+          else
+            echo "mode=api" >> "$GITHUB_OUTPUT"
+            echo "Auth: Anthropic API key"
+          fi
+
+      - name: Skip if a claude review already exists for this commit
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
+        run: |
+          # Per-commit idempotency. If a claude[bot] review already exists
+          # for the current HEAD sha, don't post another.
+          EXISTING=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews" \
+            --jq "[.[] | select(.user.login==\"claude[bot]\") | select(.commit_id==\"$HEAD_SHA\")] | length")
+          if [ "${EXISTING:-0}" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "A claude[bot] review already exists for $HEAD_SHA; skipping."
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          node-version: 20
+
+      - name: Build review context
+        # Pre-fetches everything the reviewer needs into a single file so the
+        # agent doesn't burn turns rediscovering context. Includes: PR metadata,
+        # diff vs. base, list of changed files, full source of each changed file
+        # (size-capped), and the test output (if TEST_COMMAND is set).
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+          BASE_REF: ${{ steps.ctx.outputs.base_ref }}
+          MAX_LINES_PER_FILE: '800'
+          MAX_BYTES_PER_FILE: '120000'
+        run: |
+          set -euo pipefail
+          CTX=/tmp/review-context.md
+          : > "$CTX"
+
+          {
+            echo "# Review context"
+            echo
+            echo "## PR metadata"
+            gh pr view "$PR_NUMBER" --json number,title,author,body,baseRefName,headRefName \
+              --jq '"PR #\(.number): \(.title)\nAuthor: \(.author.login)\nBase: \(.baseRefName) ← Head: \(.headRefName)\n\n--- PR body ---\n\(.body // "(no body)")"'
+            echo
+          } >> "$CTX"
+
+          if [ -n "${TEST_COMMAND:-}" ]; then
+            {
+              echo "## Test output ($TEST_COMMAND)"
+              echo '```'
+              bash -c "$TEST_COMMAND" 2>&1 | tail -120 || echo "(tests failed — see above)"
+              echo '```'
+              echo
+            } >> "$CTX"
+          fi
+
+          git fetch origin "$BASE_REF" --depth=200 >/dev/null 2>&1 || true
+          MERGE_BASE=$(git merge-base "origin/$BASE_REF" HEAD)
+          {
+            echo "## Changed files (vs. $BASE_REF)"
+            echo '```'
+            git diff --name-status "$MERGE_BASE"...HEAD
+            echo '```'
+            echo
+            echo "## Full diff (vs. $BASE_REF)"
+            echo '```diff'
+            git diff "$MERGE_BASE"...HEAD
+            echo '```'
+            echo
+          } >> "$CTX"
+
+          {
+            echo "## Full source of changed files"
+            echo
+            git diff --name-only --diff-filter=AM "$MERGE_BASE"...HEAD | while read -r f; do
+              [ -f "$f" ] || continue
+              if file --mime "$f" | grep -qE 'charset=binary'; then
+                echo "### \`$f\`"
+                echo "(binary — skipped)"
+                echo
+                continue
+              fi
+              SIZE=$(wc -c <"$f")
+              LINES=$(wc -l <"$f")
+              echo "### \`$f\` ($LINES lines, $SIZE bytes)"
+              if [ "$SIZE" -gt "$MAX_BYTES_PER_FILE" ] || [ "$LINES" -gt "$MAX_LINES_PER_FILE" ]; then
+                echo "(file exceeds context cap — showing first $MAX_LINES_PER_FILE lines)"
+                echo '```'
+                head -n "$MAX_LINES_PER_FILE" "$f"
+                echo '```'
+              else
+                echo '```'
+                cat "$f"
+                echo '```'
+              fi
+              echo
+            done
+          } >> "$CTX"
+
+          echo "Wrote review context: $(wc -l <"$CTX") lines, $(wc -c <"$CTX") bytes"
+
+      - name: Configure AWS credentials (Bedrock OIDC)
+        if: steps.guard.outputs.skip != 'true' && steps.auth.outputs.mode == 'bedrock'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: anthropics/claude-code-action@v1
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+          PROJECT_NAME: ${{ env.PROJECT_NAME }}
+        with:
+          use_bedrock: ${{ steps.auth.outputs.mode == 'bedrock' && 'true' || 'false' }}
+          anthropic_api_key: ${{ steps.auth.outputs.mode == 'api' && secrets.ANTHROPIC_API_KEY || '' }}
+          allowed_bots: "claude"
+          # display_report is disabled because it double-posts (its auto-aggregate
+          # review races with the explicit `gh pr review` call in the prompt).
+          claude_args: "--allowedTools Bash(*),Read(*),Glob,Grep --model ${{ env.MODEL_REVIEW }}"
+          prompt: |
+            You are a skeptical code reviewer for ${{ env.PROJECT_NAME }}. Find real problems the author missed.
+
+            **Start by reading `/tmp/review-context.md`.** It contains the PR metadata,
+            full diff, the full source of every changed file, and (when configured)
+            the test output. That is your primary context — don't burn time re-running
+            `gh pr diff`, `git diff`, or the test command. Use shell tools only when
+            you need to look at a file that *isn't* in the context dump.
+
+            Then read `CLAUDE.md`, `AGENTS.md`, `REVIEW.md`, or `CONTRIBUTING.md`
+            (whichever exist) for project conventions.
+
+            ## What to look for
+
+            ### Must flag (blocking)
+            - **Bugs**: edge cases, off-by-one errors, null/undefined paths, race conditions
+            - **Regressions**: does this change break any existing behavior?
+            - **Security**: XSS, injection, leaked secrets, auth bypass
+            - **Accessibility**: missing aria labels, keyboard traps, broken screen reader support
+            - **Missing tests**: route/lib changes without test coverage
+            - **User impact**: changes that touch in-flight user state, auth, schema, or infra
+
+            ### Should flag (non-blocking)
+            - Logic that's correct but fragile (will break on the next change)
+            - Inconsistency with patterns used elsewhere in the codebase
+            - Documented conventions not followed
+
+            ### Do NOT flag
+            - Style preferences (formatting, naming, semicolons)
+            - "You could also do X" suggestions with no concrete benefit
+            - Things that are already correct
+
+            ## Output
+            Submit exactly ONE review via `gh pr review`, then stop. Do not retry,
+            update, amend, or supplement it with extra `gh pr review`, `gh pr comment`,
+            or `gh api` calls — if the first call succeeded you are done.
+
+            **End every review body with a one-line "User impact" summary**, e.g.
+            `User impact: none — admin-only UI copy change.` or
+            `User impact: medium — error-handling path changed; tests cover the new path.`
+
+            Pick one outcome:
+            - Tests fail (see context dump) → `gh pr review $PR_NUMBER --request-changes --body "Tests fail: ..."`
+            - Blocking issues → `gh pr review $PR_NUMBER --request-changes --body "..."` with file:line references
+            - Clean → `gh pr review $PR_NUMBER --approve --body "Tests pass. No bugs, security, or accessibility issues found.\n\nUser impact: ..."`
+
+            Be direct. Short is better than thorough.
+
+      - name: Verify claude[bot] review was posted
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
+        run: |
+          # The SDK can exit successfully without calling `gh pr review`,
+          # leaving the PR unreviewed and any required status check green.
+          # Fail loudly instead so the workflow can be re-triggered.
+          COUNT=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews" \
+            --jq "[.[] | select(.user.login==\"claude[bot]\") | select(.commit_id==\"$HEAD_SHA\")] | length")
+          if [ "${COUNT:-0}" -eq 0 ]; then
+            echo "::error::No claude[bot] review posted for $HEAD_SHA. Re-run with: gh workflow run code-review.yml --ref <branch>"
+            exit 1
+          fi
+          echo "claude[bot] review exists for $HEAD_SHA"

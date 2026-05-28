@@ -1,0 +1,127 @@
+name: revise
+
+# When the code-review workflow's reviewer requests changes on a bot-authored
+# PR, this workflow makes one fixup commit. One pass only — uses a label to
+# prevent re-runs.
+#
+# Triggers only on PRs carrying the bot label (default: `pilot`). Change
+# vars.PILOT_LABEL to match the label your pilot workflow uses.
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  revise:
+    if: |
+      github.event.review.state == 'changes_requested' &&
+      github.event.review.user.login == 'claude[bot]' &&
+      contains(github.event.pull_request.labels.*.name, vars.PILOT_LABEL || 'pilot') &&
+      !contains(github.event.pull_request.labels.*.name, 'pilot-revised') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    env:
+      PROJECT_NAME: ${{ vars.PROJECT_NAME || github.event.repository.name }}
+      TEST_COMMAND: ${{ vars.TEST_COMMAND }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-2' }}
+      MODEL_REVISE: ${{ vars.MODEL_REVISE || 'us.anthropic.claude-haiku-4-5-20251001-v1:0' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: Detect auth mode
+        id: auth
+        env:
+          BEDROCK_ROLE: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+        run: |
+          if [ -n "$BEDROCK_ROLE" ]; then
+            echo "mode=bedrock" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=api" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Prevent the agent from committing claude-code-action workspace
+      # artifacts (.claude-pr/, .claude/) into the PR branch.
+      - name: Ignore Claude Action workspace artifacts
+        run: |
+          mkdir -p .git/info
+          {
+            echo '.claude-pr/'
+            echo '.claude/'
+          } >> .git/info/exclude
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Mark PR as revised (prevents re-runs)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh label create pilot-revised --color 9B59B6 --description "Revise workflow has already run once on this PR" 2>/dev/null || true
+          gh pr edit "$PR_NUMBER" --add-label pilot-revised
+
+      - name: Configure AWS credentials (Bedrock OIDC)
+        if: steps.auth.outputs.mode == 'bedrock'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: anthropics/claude-code-action@v1
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_ID: ${{ github.event.review.id }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PROJECT_NAME: ${{ env.PROJECT_NAME }}
+          TEST_COMMAND: ${{ env.TEST_COMMAND }}
+        with:
+          use_bedrock: ${{ steps.auth.outputs.mode == 'bedrock' && 'true' || 'false' }}
+          anthropic_api_key: ${{ steps.auth.outputs.mode == 'api' && secrets.ANTHROPIC_API_KEY || '' }}
+          allowed_bots: "claude"
+          show_full_output: true
+          claude_args: "--allowedTools Bash(*),Read(*),Write(*),Edit,Glob,Grep --max-turns 30 --model ${{ env.MODEL_REVISE }}"
+          prompt: |
+            You are the revise agent for ${{ env.PROJECT_NAME }}. A code reviewer requested
+            changes on PR #${{ env.PR_NUMBER }}. Address the review in ONE fixup commit.
+            One shot — you do not get a second pass.
+
+            ## Step 1: Read context (≤5 turns)
+            - Read `CLAUDE.md`, `AGENTS.md`, or `CONTRIBUTING.md` (whichever exist) for conventions
+            - Run `gh pr view $PR_NUMBER --json title,body` to see the PR
+            - Run `gh api repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews/$REVIEW_ID` for the review body
+            - Run `gh api repos/${{ github.repository }}/pulls/$PR_NUMBER/comments` for inline comments
+            - Run `git log --oneline origin/${{ github.event.pull_request.base.ref }}..HEAD` to see what this PR changed
+
+            ## Step 2: Decide (1 turn)
+            - If the review's complaints are concrete and fixable within this PR's scope: proceed to Step 3.
+            - If the review rejects the PR's premise, demands major rework, or is ambiguous:
+              post a comment via `gh pr comment $PR_NUMBER --body "..."` explaining you're deferring to a human, and STOP.
+
+            ## Step 3: Fix (≤15 turns)
+            - Make the minimum changes that resolve the review's blocking issues
+            - Do not add unrelated changes or scope creep
+            - Do not revert the PR's original intent
+
+            ## Step 4: Verify and push (≤5 turns)
+            ${{ env.TEST_COMMAND != '' && format('- Run `{0}` — all tests must pass', env.TEST_COMMAND) || '- (No test command configured — skipping verification)' }}
+            - Configure git: `git config user.name "${{ env.PROJECT_NAME }}-pilot" && git config user.email "${{ env.PROJECT_NAME }}-pilot@users.noreply.github.com"`
+            - Commit: `git commit -am "Address code review feedback"`
+            - Push: `git push origin $HEAD_REF`
+            - Comment on the PR summarizing what you changed and noting this was the one allowed revision cycle:
+              `gh pr comment $PR_NUMBER --body "Addressed review feedback in <sha>. Further changes require human review."`
+
+      - name: Remove revised label if agent failed
+        if: failure() || cancelled()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$PR_NUMBER" --remove-label pilot-revised 2>/dev/null || true

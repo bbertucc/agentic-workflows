@@ -1,0 +1,17 @@
+{
+  "1": [
+    "\\b(coach|exemplar|lesson|learner\\s*profile|knowledge\\s*base)\\b"
+  ],
+  "2": [
+    "\\b(a11y|accessib|keyboard|screen\\s*reader|voiceover|nvda|jaws|aria)\\b"
+  ],
+  "3": [
+    "\\b(admin|dashboard|customizer|invite|classroom)\\b"
+  ],
+  "4": [
+    "\\b(auth|token|sync[-\\s]*data|visibility|share)\\b"
+  ],
+  "5": [
+    "\\b(deploy|ci|cd|sam|cloudformation|lambda|cloudwatch|infra)\\b"
+  ]
+}
