@@ -1,4 +1,4 @@
-# agentic-workflows
+# Blake's Agentic Workflows
 
 GitHub Actions workflows for running [Claude Code](https://docs.claude.com/en/docs/claude-code) as an autonomous engineering teammate on your repo: PR reviewer, issue triager, daily pilot, and detector alarms — all powered by [`anthropics/claude-code-action`](https://github.com/anthropics/claude-code-action).
 
