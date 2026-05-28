@@ -11,12 +11,15 @@ The workflow first runs `scripts/pilot-report.js`, which produces a markdown rep
 3. **Pilot track record (last 30 days)** — merge rate, plus a **looped issues** list (any issue with ≥2 closed-unmerged pilot PRs). Looped issues are also forbidden.
 4. **Open `ready-for-pilot` issues (tier-classified)** — the candidate pool.
 
-Then the agent reads the report (plus `CLAUDE.md` and `.github/PILOT_GUIDELINES.md`) and applies a strict picking order:
+Then the agent reads the report (plus `CLAUDE.md` and `.github/PILOT_GUIDELINES.md`) and applies the rules in this order:
 
-1. Severity interrupt from extras (if your guidelines name one)
-2. Community-authored `ready-for-pilot` issue (lowest tier number → oldest first)
-3. Self-filed `ready-for-pilot` issue (if `PILOT_AUTHOR` is configured)
-4. Extras signal — only when no actionable issues exist
+**0. Severity interrupt** (evaluated *before* the picking order, if your guidelines name one): a signal flagged as severity-interrupt outranks the entire issue queue. The agent must either fix it or escalate with a loud `SKIP: ESCALATING …`.
+
+**Strict picking order — first match wins:**
+
+1. Community-authored `ready-for-pilot` issue (lowest tier number → oldest first)
+2. Self-filed `ready-for-pilot` issue (if `PILOT_AUTHOR` is configured)
+3. Extras signal — only when no actionable issues exist
 
 **Volume is not a tie-breaker against authored issues.** A 50-line server error and a one-line community issue both count as "one signal"; the community issue wins because someone took the time to file it with context the bot doesn't have.
 

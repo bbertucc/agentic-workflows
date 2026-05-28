@@ -24,7 +24,7 @@ If both auth secrets are set, the workflows use Bedrock. To switch to API mode, 
 | `MODEL_PILOT` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | pilot | Pilot model id |
 | `MODEL_REVISE` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | revise | Revise model id |
 | `PILOT_LABEL` | `pilot` | pilot, revise | Label on pilot-authored PRs |
-| `READY_LABEL` | `ready-for-pilot` | pilot, intake | Label on triaged actionable issues |
+| `READY_LABEL` | `ready-for-pilot` | pilot only | Label the pilot looks for. **Intake hardcodes `ready-for-pilot`** — to rename across the suite, edit the `gh label create` lines and prompt references in `issue-intake.yml` as well. |
 | `PILOT_AUTHOR` | _(empty)_ | pilot | GitHub login of the pilot bot (e.g. `my-project-pilot`); enables community-vs-self-filed distinction in reports |
 
 ### Anthropic API model IDs
@@ -44,7 +44,7 @@ These are checked into the consuming repo at the paths shown. The workflows look
 | `.github/pilot-tiers.json` | scripts/pilot-report.js | Tier-classifier regex override (`{ tier: regex[] }`) |
 | `scripts/pilot-report-extras.js` | scripts/pilot-report.js | Appends custom markdown to the pilot's daily report |
 | `scripts/log-watch-detector.js` | scripts/log-watch.js | Detector for log-watch — required for that workflow to do anything |
-| `CLAUDE.md` / `AGENTS.md` / `CONTRIBUTING.md` | All AI workflows | Project conventions; agents read whichever exists |
+| `CLAUDE.md` / `AGENTS.md` / `CONTRIBUTING.md` / `REVIEW.md` / `README.md` | All AI workflows | Project conventions; each agent reads whichever exist. Code-review also reads `REVIEW.md`; intake reads `README.md` for project overview |
 
 ## Cron schedules
 

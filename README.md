@@ -12,8 +12,8 @@ Originally extracted from [plato](https://github.com/1111philo/plato), where the
 | `revise.yml` | Reviewer requests changes on bot-labeled PR | One-shot fixup commit |
 | `issue-intake.yml` | Issue opened/reopened/commented | Triage → `ready-for-pilot`, `needs-info`, `needs-decomposition`, or close |
 | `issue-intake-sweep.yml` | Every 6 hours | Backstop for failed intake runs |
-| `needs-info-rescan.yml` | Daily | Catches reporter replies that didn't fire `issue_comment` |
-| `pilot.yml` | Daily cron + manual | Picks one `ready-for-pilot` issue, opens a PR (or SKIPs) |
+| `needs-info-rescan.yml` | Weekday mornings (Sun–Thu) | Catches reporter replies that didn't fire `issue_comment` |
+| `pilot.yml` | Weekday mornings (Sun–Thu) + manual | Picks one `ready-for-pilot` issue, opens a PR (or SKIPs) |
 | `log-watch.yml` | Every 2 hours | Runs your detector script; opens an idempotent issue when it fires |
 
 ## Quickstart
