@@ -28,6 +28,10 @@ The workflows support two auth modes for calling Claude. Pick one.
 
 ### IAM trust policy example
 
+The `sub` condition determines which workflow runs in your repo can assume the role. There are three tightness levels — pick the tightest one you can live with.
+
+**Loose (any branch, any workflow):** simple but means any push to any branch — including a malicious workflow added in a PR branch — can assume the role.
+
 ```json
 {
   "Version": "2012-10-17",
@@ -46,6 +50,43 @@ The workflows support two auth modes for calling Claude. Pick one.
   }]
 }
 ```
+
+**Tighter (main branch only):** workflows on `main` can assume the role; PR branches cannot. Combine with branch protection on `main`.
+
+```json
+"StringEquals": {
+  "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+  "token.actions.githubusercontent.com:sub": "repo:YOUR-ORG/YOUR-REPO:ref:refs/heads/main"
+}
+```
+
+**Tightest (specific workflows pinned to a ref):** uses the `job_workflow_ref` claim. Only the exact workflow file at the exact ref can assume the role. A PR that adds or modifies any other workflow file cannot abuse the credentials. **Recommended for production.**
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+      },
+      "StringLike": {
+        "token.actions.githubusercontent.com:job_workflow_ref": [
+          "YOUR-ORG/YOUR-REPO/.github/workflows/code-review.yml@refs/heads/main",
+          "YOUR-ORG/YOUR-REPO/.github/workflows/issue-intake.yml@refs/heads/main",
+          "YOUR-ORG/YOUR-REPO/.github/workflows/pilot.yml@refs/heads/main",
+          "YOUR-ORG/YOUR-REPO/.github/workflows/revise.yml@refs/heads/main"
+        ]
+      }
+    }
+  }]
+}
+```
+
+Note that `job_workflow_ref` pins the *workflow file*, but the *checkout step* inside the workflow still uses whatever ref triggered the run (typically a PR branch). Code-review needs to read PR-branch code to review it — that's expected. The tightening prevents an attacker from creating a *different* workflow file that abuses the credentials, not from running the legitimate workflows against their PR.
 
 ### IAM permissions policy example
 

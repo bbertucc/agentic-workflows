@@ -24,6 +24,18 @@ The reviewer prompt is inline in the workflow file. Common customizations:
 
 Every review ends with a `User impact: low / medium / high` summary line. This was added because plato auto-deploys to production on merge to `main` — the review is the last human-free checkpoint. If your project doesn't auto-deploy on merge, this line is harmless context but you may want to drop it from the prompt.
 
+## Fork PRs are not reviewed (intentional)
+
+The workflow triggers on `pull_request`, **not** `pull_request_target`. This is a deliberate security choice: `pull_request_target` runs in the base-repo context with access to repo secrets and a privileged `GITHUB_TOKEN`, while checking out PR-author-controlled code — a classic exfiltration vector if any step ever evaluates that code.
+
+Side effect: PRs from forks run without access to `AWS_BEDROCK_ROLE_ARN` / `ANTHROPIC_API_KEY`. The auth step proceeds with empty credentials, the agent step fails, and the verify step then fails the job loudly. The PR shows a failing `review` check.
+
+For projects that accept fork contributions, options:
+
+1. **Manually re-run review on each fork PR after a quick sanity check.** Trigger via `gh workflow run code-review.yml --ref <fork-branch> -f pr_number=<n>` from the base repo — `workflow_dispatch` runs in the base context and gets secrets, and the PR-fetch is from your own remote.
+2. **Use a maintainer-mediated workflow.** Require fork PRs to be re-opened from a base-repo branch before the bot reviews.
+3. **Do not use `pull_request_target` as a workaround.** It is not safe with the current claude-code-action tool permissions.
+
 ## Re-running on demand
 
 ```bash
@@ -36,6 +48,6 @@ The guard step still applies — it will skip if a review already exists for HEA
 
 If you make the `review` job a required status check on your default branch:
 
-- Pair it with required approving reviews so a self-approved PR can't ship without the bot
 - The verify step's `exit 1` on missing review correctly fails the required check (rather than silently passing)
+- Pair the status check with **Require review from Code Owners** + a humans-only CODEOWNERS file, so the bot's approving review can't satisfy a "1 approving review" rule on a pilot-authored PR. See the README's "Branch protection recommendation" section for the full set of settings.
 - Admins should remain on the bypass list for emergencies

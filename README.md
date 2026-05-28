@@ -63,13 +63,24 @@ See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).
 
 ## Branch protection recommendation
 
-If you use `code-review.yml` as a required check, also use it as a required reviewer. Combine with:
+If you use `code-review.yml` as a required check, you need to prevent the bot from self-approving pilot PRs. The `claude[bot]` account can post reviews, including approving ones — without extra config, an approving bot review can satisfy a "1 approving review required" rule on a pilot-authored PR, meaning the bot can effectively merge itself.
 
-- Required PR + 1 approving review
-- Required status check: `review` (or whatever your workflow's job is named)
-- No force pushes, no deletion
+Set branch protection on your default branch with **all** of:
 
-Admins should be on the bypass list for emergencies.
+- **Require a pull request before merging** (always)
+- **Require approvals** — set count to 1+
+- **Require review from Code Owners** — and create a `CODEOWNERS` file listing only humans:
+  ```
+  # .github/CODEOWNERS
+  * @your-github-username @another-maintainer
+  ```
+  This guarantees a human approval is needed regardless of what bots do.
+- **Dismiss stale pull request approvals when new commits are pushed** — so the revise workflow's fixup commit invalidates any prior bot approval.
+- **Require status checks to pass before merging**, with the `review` check (or whatever your code-review job is named) selected.
+- **Do not allow bypassing the above settings** — except for repo admins explicitly added to the bypass list for emergencies.
+- No force pushes, no deletion.
+
+The combined effect: a pilot PR needs (a) a passing bot review (status check), (b) a human CODEOWNER approval, and any subsequent commit invalidates (b) so the human re-approves.
 
 ## Cost notes
 
