@@ -83,4 +83,6 @@ These workflows were extracted from [plato](https://github.com/1111philo/plato) 
 
 ## License
 
-MIT.
+Copyright (C) 2026 University of Illinois Chicago.
+
+Licensed under the [GNU Affero General Public License v3.0](LICENSE). If you modify these workflows and run them as part of a service made available over a network, you must offer the modified source to users of that service.
