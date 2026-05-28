@@ -81,8 +81,3 @@ Wall-clock budgets via `timeout-minutes` on the review job (12 min) and `--max-t
 
 These workflows were extracted from [plato](https://github.com/1111philo/plato) — an open-source AI-powered microlearning platform. The original incident history that shaped each workflow (why the per-commit guard, why the dup-blocklist, why the data-loss interrupt) lives in [plato's `docs/AUTOMATION.md`](https://github.com/1111philo/plato/blob/main/docs/AUTOMATION.md).
 
-## License
-
-Copyright (C) 2026 University of Illinois Chicago.
-
-Licensed under the [GNU Affero General Public License v3.0](LICENSE). If you modify these workflows and run them as part of a service made available over a network, you must offer the modified source to users of that service.

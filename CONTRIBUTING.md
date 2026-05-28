@@ -70,8 +70,4 @@ Open an issue with:
 - What you expected vs. what happened
 - Your auth mode (Bedrock OIDC or Anthropic API) and model IDs
 
-For security issues (credential exposure, prompt-injection paths in the workflows, etc.), please contact the maintainers privately via GitHub's [private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing/privately-reporting-a-security-vulnerability) on this repo rather than opening a public issue.
-
-## License
-
-By contributing, you agree your contributions will be licensed under the [GNU Affero General Public License v3.0](LICENSE).
+For security issues (credential exposure, prompt-injection paths in the workflows, etc.), please contact the maintainer privately via GitHub's [private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing/privately-reporting-a-security-vulnerability) on this repo rather than opening a public issue.
